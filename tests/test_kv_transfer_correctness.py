@@ -330,7 +330,7 @@ def make_tp_group(cpu_ptr, all_gpu, num_gpus, gpu_layout, num_layers,
     )
 
 
-def make_layerwise_group(cpu_ptr_unused, all_gpu, num_gpus, gpu_layout, num_layers,
+def make_layerwise_group(cpu_tensor, all_gpu, num_gpus, gpu_layout, num_layers,
                          ce_segment_threshold=None,
                          ce_path_opt=None,
                          ce_enable_memcpy2d=None,
@@ -361,18 +361,13 @@ def make_layerwise_group(cpu_ptr_unused, all_gpu, num_gpus, gpu_layout, num_laye
     def strides_tensor(getter):
         return torch.tensor([getter() * ES] * num_gpus, dtype=torch.int64)
 
-    # NOTE: the C++ LayerwiseTransferGroup ctor has the indexer_* params
-    # (with torch::Tensor()/empty-container defaults) sitting BEFORE the
-    # non-defaulted ce_segment_threshold/ce_path_opt. When a
-    # caller omits the indexer_* args, pybind11 fails to synthesize their
-    # defaults and rejects the whole call ("incompatible constructor
-    # arguments"). Pass every trailing param explicitly (empty tensors / {})
-    # so pybind11 never has to fill a default. (See pybind11-construct-debug.)
-    empty_tensor = torch.Tensor()
+    # Pass every trailing optional parameter explicitly. This exercises the
+    # same SWA-capable + adaptive-CE constructor used by production.
+    empty_tensor = torch.empty(0)
     return LayerwiseTransferGroup(
         num_gpus=num_gpus,
         gpu_blocks=all_gpu,
-        cpu_blocks=cpu_ptr_unused,  # actual pinned CPU tensor
+        cpu_blocks=cpu_tensor,
         ssd_files={},
         num_layers=num_layers,
         gpu_kv_strides_tensor=strides_tensor(gpu_layout.get_kv_stride),
@@ -383,13 +378,14 @@ def make_layerwise_group(cpu_ptr_unused, all_gpu, num_gpus, gpu_layout, num_laye
         iouring_flags=0,
         layer_eventfds_tensor=layer_eventfds_tensor,
         tp_size=num_gpus,
-        indexer_gpu_blocks=[],
-        indexer_cpu_blocks=empty_tensor,
-        indexer_gpu_kv_strides_tensor=empty_tensor,
-        indexer_gpu_block_strides_tensor=empty_tensor,
-        indexer_gpu_layer_strides_tensor=empty_tensor,
-        indexer_gpu_chunk_sizes_tensor=empty_tensor,
-        indexer_ssd_files={},
+        has_swa=False,
+        swa_gpu_blocks=[],
+        swa_cpu_blocks=empty_tensor,
+        swa_ssd_files={},
+        swa_gpu_kv_strides_tensor=empty_tensor,
+        swa_gpu_block_strides_tensor=empty_tensor,
+        swa_gpu_layer_strides_tensor=empty_tensor,
+        swa_gpu_chunk_sizes_tensor=empty_tensor,
         ce_segment_threshold=ce_segment_threshold,
         ce_path_opt=ce_path_opt,
         ce_enable_memcpy2d=ce_enable_memcpy2d,
@@ -409,11 +405,9 @@ def layerwise_h2d_readback(all_gpu, cpu_kv, num_gpus, gpu_layout, num_layers,
     """Run a single CE H2D via LayerwiseTransferGroup, reading `cpu_kv` back
     into `all_gpu` with block-id list `ids`.
 
-    LayerwiseTransferGroup is H2D-only and CE-only; this wraps the fragile
-    full-argument layerwise_transfer() call (see pybind11-construct-debug:
-    every trailing optional param must be passed explicitly, otherwise
-    pybind11 fails to synthesize the torch::Tensor() defaults). Shared by the
-    CE-path layerwise test and the roundtrip layerwise twins.
+    LayerwiseTransferGroup is H2D-only and CE-only; this wraps the
+    SWA-capable layerwise_transfer() call. Shared by the CE-path layerwise
+    test and the roundtrip layerwise twins.
 
     notify_mode: "hostfunc" (default, uses CUDA hostfunc callback) or
     "polling" (uses a CPU polling thread that queries cudaEventQuery per
@@ -427,7 +421,6 @@ def layerwise_h2d_readback(all_gpu, cpu_kv, num_gpus, gpu_layout, num_layers,
                                     is_blockfirst=is_blockfirst,
                                     ce_enable_memcpy2d=enable_memcpy2d)
     empty_ids = torch.empty(0, dtype=torch.int64).pin_memory()
-    empty_indexer = torch.Tensor()
     lw_group.layerwise_transfer(
         ssd_block_ids=empty_ids,
         cpu_block_ids_d2h=empty_ids,
@@ -446,18 +439,10 @@ def layerwise_h2d_readback(all_gpu, cpu_kv, num_gpus, gpu_layout, num_layers,
         num_layers=num_layers, layer_granularity=num_layers if layer_granularity is None else layer_granularity,
         is_mla=is_mla,
         counter_id=0,
-        indexer_gpu_block_id_tensor=empty_indexer,
-        indexer_cpu_block_id_tensor=empty_indexer,
-        indexer_cpu_block_stride_in_bytes=0,
-        indexer_cpu_layer_stride_in_bytes=0,
-        indexer_h2d_cpu_kv_stride_in_bytes=0,
-        indexer_h2d_cpu_layer_stride_in_bytes=0,
-        indexer_ssd_block_ids=empty_indexer,
-        indexer_cpu_block_ids_d2h=empty_indexer,
-        indexer_ssd_layer_stride_in_bytes=0,
-        indexer_ssd_kv_stride_in_bytes=0,
-        indexer_cpu_chunk_size_in_bytes=0,
-        indexer_num_blocks_per_file=0,
+        swa_h2d_src=empty_ids,
+        swa_h2d_dst=empty_ids,
+        swa_disk2h_src=empty_ids,
+        swa_disk2h_dst=empty_ids,
         mla_d2h_mode=mode,
         notify_mode=notify_mode,
     )
@@ -750,10 +735,18 @@ def test_layerwise_h2d_notify_modes(data_config, engine_name, use_ce, notify_mod
         cpu_stride_kv, cpu_stride_layer, cpu_stride_block,
         gpu_layout.get_chunk_size() * ES,
         cpu_stride_kv, cpu_stride_layer, cpu_stride_tp,
-        4, use_ce, num_layers, 1, True, 0,
-        torch.Tensor(), torch.Tensor(), 0, 0, 0, 0,
-        torch.Tensor(), torch.Tensor(), 0, 0, 0, 0,
-        "sharded", notify_mode,
+        4, use_ce, num_layers, 1, True,
+        counter_id=0,
+        # pybind cannot fill the SWA tensor defaults (torch::Tensor() -> None
+        # can't cast back to a non-optional `torch.Tensor` param), so the four
+        # swa_* tensors must be passed explicitly even for this non-SWA test.
+        # Mirrors production LayerwiseTransfer._swa_transfer_kwargs().
+        swa_h2d_src=torch.empty(0, dtype=torch.int64),
+        swa_h2d_dst=torch.empty(0, dtype=torch.int64),
+        swa_disk2h_src=torch.empty(0, dtype=torch.int64),
+        swa_disk2h_dst=torch.empty(0, dtype=torch.int64),
+        mla_d2h_mode="sharded",
+        notify_mode=notify_mode,
     )
     sync_all(num_gpus)
 
@@ -1480,16 +1473,37 @@ def test_mla_designated_rank_d2h(data_config, designated_rank):
             all_gpu[g][l].zero_()
     sync_all(num_gpus)
     lw = make_layerwise_group(cpu_kv, all_gpu, num_gpus, gpu_layout, num_layers, is_blockfirst=True, is_mla=True)
+    empty_ids = torch.empty(0, dtype=torch.int64)
     lw.layerwise_transfer(
-        torch.empty(0, dtype=torch.int64), torch.empty(0, dtype=torch.int64),
-        0, 0, 0, 0, 0, ids, ids,
-        cpu_layout_tp.get_kv_stride() * ES, cpu_layout_tp.get_layer_stride() * ES, cpu_stride_block,
-        gpu_layout.get_chunk_size() * ES,
-        cpu_layout_tp.get_kv_stride() * ES, cpu_layout_tp.get_layer_stride() * ES, cpu_stride_tp,
-        4, True, num_layers, 1, True, 0,
-        torch.Tensor(), torch.Tensor(), 0, 0, 0, 0,
-        torch.Tensor(), torch.Tensor(), 0, 0, 0, 0,
-        "rank0_only", "hostfunc")
+        ssd_block_ids=empty_ids,
+        cpu_block_ids_d2h=empty_ids,
+        ssd_layer_stride_in_bytes=0,
+        ssd_kv_stride_in_bytes=0,
+        num_blocks_per_file=0,
+        round_robin=0,
+        num_threads_per_device=0,
+        gpu_block_id_tensor=ids,
+        cpu_block_id_tensor=ids,
+        cpu_kv_stride_in_bytes=cpu_layout_tp.get_kv_stride() * ES,
+        cpu_layer_stride_in_bytes=cpu_layout_tp.get_layer_stride() * ES,
+        cpu_block_stride_in_bytes=cpu_stride_block,
+        cpu_chunk_size_in_bytes=gpu_layout.get_chunk_size() * ES,
+        h2d_cpu_kv_stride_in_bytes=cpu_layout_tp.get_kv_stride() * ES,
+        h2d_cpu_layer_stride_in_bytes=cpu_layout_tp.get_layer_stride() * ES,
+        cpu_tp_stride_in_bytes=cpu_stride_tp,
+        transfer_cta_num=4,
+        use_ce_transfer=True,
+        num_layers=num_layers,
+        layer_granularity=1,
+        is_mla=True,
+        counter_id=0,
+        swa_h2d_src=empty_ids,
+        swa_h2d_dst=empty_ids,
+        swa_disk2h_src=empty_ids,
+        swa_disk2h_dst=empty_ids,
+        mla_d2h_mode="rank0_only",
+        notify_mode="hostfunc",
+    )
     sync_all(num_gpus)
     spot_check_gpu(all_gpu, 0, num_gpus, num_layers, num_blocks, tpb, head_dim, kv_dim, label=f"designated={designated_rank}")
     del lw

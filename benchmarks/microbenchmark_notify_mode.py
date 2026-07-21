@@ -70,13 +70,6 @@ def make_layerwise_group(cpu_kv, all_gpu, num_gpus, gpu_layout, num_layers,
     def strides_tensor(getter):
         return torch.tensor([getter() * ES] * num_gpus, dtype=torch.int64)
     ssd_files = {}
-    indexer_gpu_blocks = []
-    indexer_cpu_blocks = torch.Tensor()
-    indexer_gpu_kv_strides = torch.Tensor()
-    indexer_gpu_block_strides = torch.Tensor()
-    indexer_gpu_layer_strides = torch.Tensor()
-    indexer_gpu_chunk_sizes = torch.Tensor()
-    indexer_ssd_files = {}
     layer_eventfds_tensor = torch.empty(0, dtype=torch.int32)
 
     return LayerwiseTransferGroup(
@@ -86,11 +79,9 @@ def make_layerwise_group(cpu_kv, all_gpu, num_gpus, gpu_layout, num_layers,
         strides_tensor(gpu_layout.get_layer_stride),
         strides_tensor(gpu_layout.get_chunk_size),
         0, 0, layer_eventfds_tensor, num_gpus,
-        indexer_gpu_blocks, indexer_cpu_blocks, indexer_gpu_kv_strides,
-        indexer_gpu_block_strides, indexer_gpu_layer_strides,
-        indexer_gpu_chunk_sizes, indexer_ssd_files,
         is_mla=is_mla,
-        is_blockfirst=is_blockfirst)
+        is_blockfirst=is_blockfirst,
+    )
 
 
 def bench_one(num_layers, num_blocks, tpb, head_dim, num_gpus, use_ce,
@@ -106,19 +97,38 @@ def bench_one(num_layers, num_blocks, tpb, head_dim, num_gpus, use_ce,
     cpu_stride_tp = cpu_stride_block // num_gpus
     chunk_size = gpu_layout.get_chunk_size() * ES
 
-    lw = make_layerwise_group(cpu_kv, all_gpu, num_gpus, gpu_layout, num_layers)
+    lw = make_layerwise_group(
+        cpu_kv, all_gpu, num_gpus, gpu_layout, num_layers,
+        is_mla=True, is_blockfirst=True,
+    )
 
-    def run_once():
-        lw.layerwise_transfer(
-            torch.empty(0, dtype=torch.int64), torch.empty(0, dtype=torch.int64),
-            0, 0, 0, 0, 0,
-            block_ids, block_ids,
-            cpu_stride_kv, cpu_stride_layer, cpu_stride_block, chunk_size,
-            cpu_stride_kv, cpu_stride_layer, cpu_stride_tp,
-            4, use_ce, num_layers, 1, True, 0,
-            torch.Tensor(), torch.Tensor(), 0, 0, 0, 0,
-            torch.Tensor(), torch.Tensor(), 0, 0, 0, 0,
-            "sharded", notify_mode,
+    def run_once(group=lw):
+        empty_ids = torch.empty(0, dtype=torch.int64)
+        group.layerwise_transfer(
+            ssd_block_ids=empty_ids,
+            cpu_block_ids_d2h=empty_ids,
+            ssd_layer_stride_in_bytes=0,
+            ssd_kv_stride_in_bytes=0,
+            num_blocks_per_file=0,
+            round_robin=0,
+            num_threads_per_device=0,
+            gpu_block_id_tensor=block_ids,
+            cpu_block_id_tensor=block_ids,
+            cpu_kv_stride_in_bytes=cpu_stride_kv,
+            cpu_layer_stride_in_bytes=cpu_stride_layer,
+            cpu_block_stride_in_bytes=cpu_stride_block,
+            cpu_chunk_size_in_bytes=chunk_size,
+            h2d_cpu_kv_stride_in_bytes=cpu_stride_kv,
+            h2d_cpu_layer_stride_in_bytes=cpu_stride_layer,
+            cpu_tp_stride_in_bytes=cpu_stride_tp,
+            transfer_cta_num=4,
+            use_ce_transfer=use_ce,
+            num_layers=num_layers,
+            layer_granularity=1,
+            is_mla=True,
+            counter_id=0,
+            mla_d2h_mode="sharded",
+            notify_mode=notify_mode,
         )
 
     for _ in range(warmup):
@@ -228,7 +238,7 @@ def main():
         print("No GPU available")
         sys.exit(1)
 
-    print(f"FlexKV Layerwise Notify-Mode Benchmark")
+    print("FlexKV Layerwise Notify-Mode Benchmark")
     print(f"  GPUs={num_gpus}  warmup={WARMUP_ITERS}  iters={BENCH_ITERS}  "
           f"dtype={str(DTYPE)}  (cuda=kernel / ce=cudaMemcpyAsync)")
 
