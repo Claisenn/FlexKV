@@ -89,7 +89,6 @@ def test_layerwise_fuses_heterogeneous_swa_state_h2d() -> None:
         op_callback_dict={},
         layerwise_transfer=True,
         counter_id=2,
-        fuse_swa_into_layerwise=True,
     )
 
     layerwise_ops = [
@@ -137,7 +136,6 @@ def test_swa_multi_layer_false_keeps_sidecar_h2d_as_predecessor() -> None:
         op_callback_dict={},
         layerwise_transfer=True,
         counter_id=2,
-        fuse_swa_into_layerwise=False,
     )
 
     layerwise_ops = [

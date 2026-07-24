@@ -78,6 +78,7 @@ from flexkv.transfer.compression.common.strategy import (
 from flexkv.transfer.worker_op import WorkerTransferOp, WorkerLayerwiseTransferOp
 
 from flexkv.mooncakeEngineWrapper import MoonCakeTransferEngineWrapper
+from flexkv.external.mooncake_store_keys import PoolKind, build_key
 from flexkv.transfer.zmqHelper import NotifyMsg, NotifyStatus, SSDZMQServer, SSDZMQClient
 from flexkv.cache.redis_meta import RedisMeta
 from flexkv.transfer.utils import (
@@ -536,6 +537,13 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         )
 
         self.group_transfer_params: list = []
+        # Keep the imported CUDA-IPC tensors alive for the worker's lifetime.
+        # _get_layer_ptrs() below records only their raw data_ptr()s; if the
+        # tensors themselves were allowed to go out of scope, PyTorch would
+        # release the underlying CUDA IPC mapping and the stored pointers would
+        # dangle, so the per-group transfer would read/write freed device
+        # memory (observed as the indexer group silently restoring zeros).
+        self._multi_group_gpu_blocks_keepalive: list = []
         cpu_offset_bytes = 0  # byte offset of this group within a CPU block
 
         for gi, (g, gpu_layout) in enumerate(zip(layer_groups, gpu_layouts_per_group)):
@@ -544,6 +552,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
 
             # Resolve GPU tensors for this group
             group_gpu_blocks = import_tensor_handles(gpu_blocks_per_group[gi])
+            self._multi_group_gpu_blocks_keepalive.append(group_gpu_blocks)
             group_gpu_ptrs = self._get_layer_ptrs(group_gpu_blocks)
 
             # Compressed groups: GPU tensor's tokens dim equals tpb_g, not tpb.
@@ -902,6 +911,12 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
         )
 
         self.tp_group_transfer_groups: list = []
+        # Keep imported CUDA-IPC tensors alive for the worker's lifetime:
+        # TPTransferThreadGroup below stores only their raw data_ptr()s, so if
+        # the tensors were dropped PyTorch would release the IPC mapping and the
+        # pointers would dangle (mirrors GPUCPUTransferWorker._init_multi_group
+        # and LayerwiseWorker._init_multi_group).
+        self._multi_group_gpu_blocks_keepalive: list = []
         cpu_offset_bytes = 0
 
         for gi, g in enumerate(layer_groups):
@@ -916,6 +931,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
             imported_group_blocks = []
             for handles_in_one_gpu in group_gpu_blocks_per_gpu:
                 imported_group_blocks.append(import_tensor_handles(handles_in_one_gpu))
+            self._multi_group_gpu_blocks_keepalive.append(imported_group_blocks)
 
             # Build flat pointer list for this group
             gpu_block_ptrs_flat = [
@@ -1633,6 +1649,10 @@ class GDSTransferWorker(TransferWorkerBase):
         self.ssd_block_stride_in_bytes = ssd_kv_layout.get_block_stride()
 
         self.group_gds_params: list = []
+        # Keep imported CUDA-IPC tensors alive: _get_layer_ptrs() records only
+        # raw data_ptr()s below, so dropping the tensors would free the IPC
+        # mapping and dangle the stored pointers.
+        self._multi_group_gpu_blocks_keepalive: list = []
         ssd_offset_bytes = 0
 
         for gi, g in enumerate(layer_groups):
@@ -1668,6 +1688,7 @@ class GDSTransferWorker(TransferWorkerBase):
             # GPU pointers for this group
             if gpu_blocks_per_group is not None:
                 group_gpu_blocks = import_tensor_handles(gpu_blocks_per_group[gi])
+                self._multi_group_gpu_blocks_keepalive.append(group_gpu_blocks)
                 group_gpu_ptrs = self._get_layer_ptrs(group_gpu_blocks)
             else:
                 group_gpu_ptrs = self.gpu_layer_ptrs
@@ -1955,6 +1976,10 @@ class tpGDSTransferWorker(TransferWorkerBase):
         self.ssd_block_stride_in_bytes = ssd_kv_layout.get_block_stride()
 
         self.group_tp_gds_params: list = []
+        # Keep imported CUDA-IPC tensors alive: only data_ptr()s are recorded
+        # below, so dropping the tensors would free the IPC mapping and dangle
+        # the stored pointers.
+        self._multi_group_gpu_blocks_keepalive: list = []
         ssd_offset_bytes = 0
 
         gpu_device_ids = [self.gpu_blocks[i][0].device.index for i in range(self.num_gpus)]
@@ -1984,6 +2009,7 @@ class tpGDSTransferWorker(TransferWorkerBase):
                     grp_layout = gpu_layouts_per_group[gi][gpu_idx]
                     grp_handles = gpu_blocks_per_group[gi][gpu_idx]
                     grp_tensors = [h.get_tensor() for h in grp_handles]
+                    self._multi_group_gpu_blocks_keepalive.append(grp_tensors)
 
                     gpu_strides = self._get_gpu_strides_from_tensor(
                         grp_tensors[0], tpb_g, dtype_size_g, self.is_mla,
@@ -3378,3 +3404,157 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
             flexkv_logger.info(f"Fetched node {node_id} meta from Redis.")
 
         return self.node_metas[node_id]
+
+class MooncakeStoreTransferWorker(TransferWorkerBase):
+    """Mooncake-store remote KV I/O worker (main KV and SWA pools)."""
+
+    def __init__(
+        self,
+        worker_id: int,
+        transfer_conn: Connection,
+        finished_ops_queue: MPQueue,
+        op_buffer_tensor: torch.Tensor,
+        cpu_blocks: Union[List[torch.Tensor], torch.Tensor],
+        cpu_kv_layout: "KVCacheLayout",
+        dtype: torch.dtype,
+        cache_config: "CacheConfig",
+        pool_kind: PoolKind = PoolKind.KV,
+        override_global_segment_size: Optional[int] = None,
+    ) -> None:
+        super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
+        self.pp_rank = int(getattr(cache_config, 'mooncake_store_pp_rank', 0) or 0)
+        self.pp_size = int(getattr(cache_config, 'mooncake_store_pp_size', 1) or 1)
+        self.node_layer_start = int(getattr(cache_config, 'mooncake_store_node_layer_start', 0) or 0)
+        self.node_layer_end = int(getattr(cache_config, 'mooncake_store_node_layer_end', 0) or 0)
+        self.total_layers = int(getattr(cache_config, 'mooncake_store_total_layers', 0) or 0)
+        self.pool_kind = pool_kind
+
+        cpu_blocks = materialize_worker_tensor(cpu_blocks)
+        cudaHostRegister(cpu_blocks)
+        self.cpu_layer_ptrs = self._get_layer_ptrs(cpu_blocks)
+        self.num_layers: int = cpu_kv_layout.num_layer
+        self.num_cpu_blocks: int = cpu_kv_layout.num_block
+        self.dtype = dtype
+        self.cpu_kv_layout = cpu_kv_layout
+        assert self.cpu_kv_layout.type == KVCacheLayoutType.BLOCKFIRST
+        self.is_mla: bool = cpu_kv_layout.is_mla
+        self.kv_dim = 2 if not self.is_mla else 1
+        self.cpu_blocks = cpu_blocks
+        self.cache_config = cache_config
+        self._cpu_buffer = cpu_blocks[0] if isinstance(cpu_blocks, (list, tuple)) else cpu_blocks
+        # Opaque whole-block I/O: multi-group CPU layout is byte-flat
+        # ([num_block, bytes_per_block]); get_chunk_size() is invalid there.
+        self.block_size_bytes = self._block_size_bytes(cpu_kv_layout, dtype)
+
+        from flexkv.external.mooncake_store_utils import MooncakeStoreClient, MooncakeStoreConfig
+        store_config = MooncakeStoreConfig.from_file(
+            self.cache_config,
+            override_global_segment_size=override_global_segment_size,
+        )
+        self.mooncake_client = MooncakeStoreClient(store_config)
+        self.mooncake_client.register_buffer(self._cpu_buffer)
+
+    @staticmethod
+    def _block_size_bytes(cpu_kv_layout: "KVCacheLayout", dtype: torch.dtype) -> int:
+        """Bytes per CPU block for mooncake put/get addressing.
+
+        Multi-group BLOCKFIRST stores ``bytes_per_block`` directly in
+        ``kv_shape[1]`` (via ``get_block_stride()``) — do not multiply by
+        ``dtype.itemsize``. Single-group layouts still use element count ×
+        itemsize.
+        """
+        if cpu_kv_layout.layer_groups is not None:
+            return int(cpu_kv_layout.get_block_stride())
+        return int(cpu_kv_layout.get_elements_per_block() * dtype.itemsize)
+
+    def _transfer_impl(self, cpu_ptrs, block_sizes, keys, transfer_type: TransferType) -> None:
+        if transfer_type == TransferType.H2REMOTE:
+            put_results = self.mooncake_client.batch_put(keys, cpu_ptrs, block_sizes)
+            if not all(put_results):
+                flexkv_logger.error(f"Mooncake-store batch put partially failed: {put_results}")
+        elif transfer_type == TransferType.REMOTE2H:
+            get_results = self.mooncake_client.batch_get(keys, cpu_ptrs, block_sizes)
+            if not all(get_results):
+                flexkv_logger.error(f"Mooncake-store batch get partially failed: {get_results}")
+        else:
+            raise ValueError(
+                f"MooncakeStoreTransferWorker only supports H2REMOTE/REMOTE2H, got {transfer_type}")
+
+    def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
+        if self.pool_kind == PoolKind.SWA:
+            cpu_ptrs, block_sizes, keys = self._preprocess_swa(transfer_op)
+        else:
+            cpu_ptrs, block_sizes, keys = self._preprocess_kv(transfer_op)
+        start_time = time.time()
+        self._transfer_impl(cpu_ptrs, block_sizes, keys, transfer_op.transfer_type)
+        end_time = time.time()
+        transfer_size = sum(block_sizes)
+        self._log_transfer_performance(transfer_op, transfer_size, start_time, end_time)
+        return True
+
+    def _preprocess_kv(self, transfer_op: WorkerTransferOp):
+        cpu_block_ids = (
+            transfer_op.dst_block_ids
+            if transfer_op.transfer_type == TransferType.REMOTE2H
+            else transfer_op.src_block_ids
+        )
+        assert transfer_op.mooncake_store_block_hashes is not None
+        block_size_bytes = self.block_size_bytes
+        base_ptr = self._cpu_buffer.data_ptr()
+        cpu_ptrs, block_sizes, keys = [], [], []
+        for i, blk_id in enumerate(cpu_block_ids):
+            key = build_key(
+                transfer_op.mooncake_store_block_hashes[i],
+                PoolKind.KV,
+                pp_rank=self.pp_rank,
+                pp_size=self.pp_size,
+                node_layer_start=self.node_layer_start,
+                node_layer_end=self.node_layer_end,
+                total_layers=self.total_layers,
+            )
+            cpu_ptrs.append(base_ptr + int(blk_id) * block_size_bytes)
+            block_sizes.append(block_size_bytes)
+            keys.append(key)
+        return cpu_ptrs, block_sizes, keys
+
+    def _preprocess_swa(self, transfer_op: WorkerTransferOp):
+        """Build (cpu_ptrs, sizes, keys) for the SWA mooncake lane.
+
+        Each request contributes one (CPU slot id, tail_hash) pair; after batch
+        merging, ``cpu_block_ids`` and ``mooncake_store_swa_block_hashes`` both
+        hold N entries in the same order (one key per slot).
+        """
+        tail_hashes = transfer_op.mooncake_store_swa_block_hashes
+        if tail_hashes is None:
+            raise ValueError(
+                "SWA mooncake transfer requires mooncake_store_swa_block_hashes")
+        cpu_block_ids = (
+            transfer_op.dst_block_ids
+            if transfer_op.transfer_type == TransferType.REMOTE2H
+            else transfer_op.src_block_ids
+        )
+        if len(tail_hashes) != len(cpu_block_ids):
+            raise ValueError(
+                "SWA mooncake transfer requires len(swa_block_hashes) == "
+                f"len(cpu_block_ids): got {len(tail_hashes)} vs {len(cpu_block_ids)}")
+        block_size_bytes = self.block_size_bytes
+        base_ptr = self._cpu_buffer.data_ptr()
+        cpu_ptrs: List[int] = []
+        block_sizes: List[int] = []
+        keys: List[str] = []
+        for i, blk_id in enumerate(cpu_block_ids):
+            cpu_ptrs.append(base_ptr + int(blk_id) * block_size_bytes)
+            block_sizes.append(block_size_bytes)
+            keys.append(build_key(
+                str(tail_hashes[i]),
+                PoolKind.SWA,
+                pp_rank=self.pp_rank,
+                pp_size=self.pp_size,
+                node_layer_start=self.node_layer_start,
+                node_layer_end=self.node_layer_end,
+                total_layers=self.total_layers,
+            ))
+        return cpu_ptrs, block_sizes, keys
+
+    def _postprocess(self, transfer_op: WorkerTransferOp) -> None:
+        pass

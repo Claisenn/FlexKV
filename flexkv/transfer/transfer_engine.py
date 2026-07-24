@@ -40,7 +40,9 @@ from flexkv.transfer.worker import (
     tpGDSTransferWorker,
     NixlTransferWorker,
     PEER2CPUTransferWorker,
+    MooncakeStoreTransferWorker,
 )
+from flexkv.external.mooncake_store_keys import PoolKind
 from flexkv.transfer.compression import build_compressors
 from flexkv.transfer.layerwise import (
     LayerwiseTransferWorker,
@@ -345,11 +347,10 @@ class TransferEngine:
     def _get_layerwise_swa_kwargs(self, worker_key: WorkerKey) -> dict:
         """SWA args for LayerwiseTransferWorker (uniform or multi-group).
 
-        With ``swa_multi_layer`` enabled, layerwise GET fuses main-KV +
-        SWA/state into one LAYERWISE op, so both layouts are wired into the
-        layerwise worker rather than a standalone SWA H2D worker.
+        When SWA is enabled, layerwise GET always binds SWA (and any C4 state
+        sidecars) into the LAYERWISE worker rather than a standalone H2D worker.
         """
-        if not self._has_swa or not self.cache_config.swa_multi_layer:
+        if not self._has_swa:
             return {}
         swa_ssd_files = (
             self._swa_ssd_handle.get_file_list()
@@ -558,6 +559,22 @@ class TransferEngine:
             )
             self._worker_map[TransferType.H2REMOTE] = self.remotecpu_write_worker
             self._worker_map[TransferType.REMOTE2H] = self.remotecpu_read_worker
+        elif (getattr(self.cache_config, 'use_mooncake_store_backend', False)
+              and self._cpu_handle is not None):
+            self.mooncake_store_worker: WorkerHandle = MooncakeStoreTransferWorker.create_worker(
+                mp_ctx=self.mp_ctx,
+                finished_ops_queue=self.finished_ops_queue,
+                op_buffer_tensor=self.pin_buffer.get_buffer(),
+                cpu_blocks=self._cpu_handle.get_worker_tensor(),
+                cpu_kv_layout=self._cpu_handle.kv_layout,
+                dtype=self._cpu_handle.dtype,
+                cache_config=self.cache_config,
+                pool_kind=PoolKind.KV,
+            )
+            self._worker_map[TransferType.H2REMOTE] = self.mooncake_store_worker
+            self._worker_map[TransferType.REMOTE2H] = self.mooncake_store_worker
+            flexkv_logger.info(
+                "[TransferEngine] mooncake-store workers created for H2REMOTE/REMOTE2H")
         if self.cache_config.enable_gds:
             assert self._ssd_handle is not None
             if self.cache_config.enable_nixl:
@@ -703,11 +720,11 @@ class TransferEngine:
         # reuse this channel with heterogeneous multi-group worker arguments.
         if self._has_swa:
             self._swa_worker_map: Dict[TransferType, Dict[WorkerKey, WorkerHandle]] = {}
-            # With swa_multi_layer enabled, layerwise GET fuses SWA/state H2D
-            # into LAYERWISE (uniform via launch_swa_h2d_layer_, multi-group via
-            # launch_swa_mg_h2d_layer_). Otherwise retain the standalone SWA
-            # H2D worker as a predecessor of the main layerwise op.
-            if not _fuse_swa_into_layerwise:
+            # When layerwise is on, SWA H2D always runs inside LAYERWISE
+            # (uniform via launch_swa_h2d_layer_, multi-group via
+            # launch_swa_mg_h2d_layer_). Standalone SWA H2D workers are only
+            # created when layerwise transfer is disabled.
+            if not _enable_layerwise:
                 if self.model_config.effective_tp_size_per_node == 1:
                     self._swa_h2d_workers: Dict[WorkerKey, WorkerHandle] = {
                         worker_key: GPUCPUTransferWorker.create_worker(
@@ -828,8 +845,26 @@ class TransferEngine:
                 flexkv_logger.info("TransferEngine: swa CPU<->SSD workers initialized")
 
 
-            # ---- SWA CPU<->Remote workers (single CPURemoteTransferWorker per dir) ----
-            if self._swa_remote_handle is not None and self._swa_cpu_handle is not None:
+            # ---- SWA CPU<->Remote workers -----------------------------------
+            if (getattr(self.cache_config, 'use_mooncake_store_backend', False)
+                    and self._swa_cpu_handle is not None):
+                self.swa_mooncake_store_worker: WorkerHandle = (
+                    MooncakeStoreTransferWorker.create_worker(
+                        mp_ctx=self.mp_ctx,
+                        finished_ops_queue=self.finished_ops_queue,
+                        op_buffer_tensor=self.pin_buffer.get_buffer(),
+                        cpu_blocks=self._swa_cpu_handle.get_worker_tensor(),
+                        cpu_kv_layout=self._swa_cpu_handle.kv_layout,
+                        dtype=self._swa_cpu_handle.dtype,
+                        cache_config=self.cache_config,
+                        pool_kind=PoolKind.SWA,
+                        override_global_segment_size=0,
+                    ))
+                self._swa_worker_map[TransferType.REMOTE2H] = self.swa_mooncake_store_worker
+                self._swa_worker_map[TransferType.H2REMOTE] = self.swa_mooncake_store_worker
+                flexkv_logger.info(
+                    "TransferEngine: swa mooncake-store workers initialized")
+            elif self._swa_remote_handle is not None and self._swa_cpu_handle is not None:
                 self.swa_remotecpu_read_worker: WorkerHandle = CPURemoteTransferWorker.create_worker(
                     mp_ctx=self.mp_ctx,
                     finished_ops_queue=self.finished_ops_queue,
@@ -898,7 +933,7 @@ class TransferEngine:
                 flexkv_logger.info("TransferEngine: swa GDS workers initialized")
             self._has_swa = True
             # Must mirror the create condition above.
-            if not _fuse_swa_into_layerwise:
+            if not _enable_layerwise:
                 flexkv_logger.info(
                     f"TransferEngine: swa workers initialized "
                     f"({len(self._swa_h2d_workers)} H2D + {len(self._swa_d2h_workers)} D2H)")
@@ -1234,6 +1269,9 @@ class TransferEngine:
                     dst_block_ids=op.dst_block_ids.copy(),
                     dp_client_id=op.dp_client_id,
                     is_swa=True,
+                    mooncake_store_swa_block_hashes=(
+                        list(op.mooncake_store_swa_block_hashes)
+                        if op.mooncake_store_swa_block_hashes is not None else None),
                 )
                 register_op_to_buffer(replica, self.pin_buffer)
                 self._child_id_to_child[replica.op_id] = replica
@@ -1299,6 +1337,9 @@ class TransferEngine:
                     src_block_ids=op.src_block_ids.copy(),
                     dst_block_ids=op.dst_block_ids.copy(),
                     dp_client_id=op.dp_client_id,
+                    mooncake_store_block_hashes=(
+                        op.mooncake_store_block_hashes.copy()
+                        if op.mooncake_store_block_hashes is not None else None),
                 )
                 register_op_to_buffer(replica, self.pin_buffer)
                 self._child_id_to_child[replica.op_id] = replica
