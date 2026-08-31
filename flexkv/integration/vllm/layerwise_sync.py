@@ -97,11 +97,30 @@ class LayerwiseStepCoordinator:
         return bool(needs_load and not self.enabled)
 
     def launch_kwargs(self, metadata: LayerwiseLoadMetadata) -> dict[str, object]:
+        # A no-load step carries counter_id=-1. Clamping that to 0 would make
+        # the data plane signal counter 0 -- which a concurrent real load may
+        # own -- so its layers could see units that belong to no transfer.
+        # Only a metadata that actually has a load may drive a layer-wise
+        # launch; otherwise fall back to the non-layer-wise path.
+        if not metadata.enabled or not metadata.has_load:
+            return {
+                "as_batch": metadata.enabled,
+                "layerwise_transfer": False,
+                "counter_id": 0,
+            }
+        self._validate_launch_counter(metadata.counter_id)
         return {
             "as_batch": metadata.enabled,
             "layerwise_transfer": metadata.enabled,
-            "counter_id": max(metadata.counter_id, 0),
+            "counter_id": metadata.counter_id,
         }
+
+    def _validate_launch_counter(self, counter_id: int) -> None:
+        if counter_id < 0 or counter_id >= self.num_counters:
+            raise ValueError(
+                f"layer-wise launch counter_id={counter_id} outside "
+                f"[0, {self.num_counters})"
+            )
 
 
 class LayerwiseCounterPool:
@@ -150,6 +169,37 @@ class LayerwiseCounterPool:
     def fds(self) -> tuple[tuple[int, ...], ...]:
         return tuple(tuple(counter_fds) for counter_fds in self._fds)
 
+    def _drain_counter(self, counter_id: int) -> None:
+        """Reclaim a counter whose forward pass ended without waiting all layers.
+
+        Consumes any already-signalled semaphore units for layers that were
+        never waited on, so no stale unit can satisfy a future wait(). Never
+        blocks and never raises: a layer the data plane has not signalled yet
+        simply has nothing to drain.
+        """
+        with self._lock:
+            if counter_id < 0 or counter_id >= self.num_counters:
+                return
+            pending = [
+                index for index, done in enumerate(self._waited[counter_id])
+                if not done
+            ]
+        for index in pending:
+            fd = self._fds[counter_id][index]
+            try:
+                while True:
+                    ready, _, _ = select.select([fd], [], [], 0)
+                    if not ready:
+                        break
+                    os.read(fd, 8)
+            except OSError:
+                # Closed/invalid fd during shutdown: nothing to reclaim.
+                pass
+        with self._lock:
+            self._waited[counter_id] = [False] * self.num_layers
+            if self._active_counter == counter_id:
+                self._active_counter = -1
+
     def release(self, counter_id: int) -> None:
         self._validate_counter(counter_id)
         with self._lock:
@@ -159,15 +209,29 @@ class LayerwiseCounterPool:
 
     def bind(self, metadata: LayerwiseLoadMetadata) -> None:
         """Bind the counter used by the current vLLM forward step."""
-        if self._failed_error is not None:
-            raise RuntimeError(
-                "layer-wise counter pool is unusable after a prior wait failure"
-            ) from self._failed_error
-        if self._active_counter >= 0:
-            raise RuntimeError(
-                "received new layer-wise metadata before the previous "
-                f"counter {self._active_counter} finished"
-            )
+        # NOTE: a prior wait() failure is recorded but is NOT fatal here.
+        # _read_eventfd raises TimeoutError after
+        # FLEXKV_LAYERWISE_WAIT_TIMEOUT_S (default 60s), which a merely slow
+        # load can hit. Poisoning the pool forever would turn one slow transfer
+        # into a dead engine for the rest of the process's life; vLLM's own
+        # kv_load_failure_policy governs how a failed load is handled. Clear the
+        # marker after draining so the next step starts from a clean counter.
+        stale = self._active_counter
+        if stale >= 0:
+            # A forward pass does not always consume every layer: vLLM can
+            # abort, preempt, or raise between attention layers, and then no
+            # further wait() calls arrive for that counter. Treating this as
+            # fatal wedges the engine permanently on the next step -- the
+            # counter can never be released because release only happens once
+            # ALL layers have been waited on. Drain and reclaim instead.
+            #
+            # Draining matters: the data plane still signals every layer of the
+            # stale batch, so leaving those units in the semaphores would let a
+            # later step's wait() return immediately on a counter whose data has
+            # not landed yet (silent KV corruption). Non-blocking, so an
+            # unsignalled layer simply leaves nothing to drain.
+            self._drain_counter(stale)
+        self._failed_error = None
         if not metadata.enabled or not metadata.has_load:
             self._active_counter = -1
             return

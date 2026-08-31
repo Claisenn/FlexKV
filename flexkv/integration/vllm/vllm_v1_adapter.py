@@ -1037,7 +1037,22 @@ class FlexKVWorkerConnector:
                 resume=resume,
             )
 
-        self._finish_layerwise_eventfd_sender()
+        # NOTE: deliberately NOT joining the eventfd sender here.
+        #
+        # In vLLM the worker registers its KV caches from inside
+        # EngineCore._initialize_kv_caches() -> initialize_from_config(), which
+        # runs BEFORE the Scheduler (and therefore before
+        # FlexKVSchedulerConnector -> KVManager.start() -> TransferManager ->
+        # LayerwiseTransferWorker) is ever constructed. The eventfd listener
+        # that this handshake connects to is created by that worker, so joining
+        # the sender thread here deadlocks: the engine cannot proceed to build
+        # the scheduler that would bind the socket. It fails only when
+        # send_to_worker() gives up after timeout_s, which is what surfaced as
+        # "timed out sending layer-wise eventfds ... No such file or directory".
+        #
+        # KV-cache registration is fire-and-forget by design (KVTPClient sends
+        # with zmq.NOBLOCK), so the handshake is joined lazily at first use
+        # instead -- see _require_layerwise_eventfds().
         logger.info("Finish register kv_caches")
         self._registered_kv_caches = dict(kv_caches)
 
@@ -1096,15 +1111,37 @@ class FlexKVWorkerConnector:
         )
         self._layerwise_sender_thread.start()
 
-    def _finish_layerwise_eventfd_sender(self) -> None:
+    def _finish_layerwise_eventfd_sender(self, timeout: Optional[float] = None
+                                         ) -> bool:
+        """Join the handshake thread. Returns True once it has completed.
+
+        With ``timeout=None`` this blocks until the handshake finishes (or the
+        sender's own deadline expires) and raises on failure. With a timeout it
+        returns False if the handshake is still in flight, leaving the thread
+        running so a later call can pick it up.
+        """
         if self._layerwise_sender_thread is None:
-            return
-        self._layerwise_sender_thread.join()
+            return True
+        self._layerwise_sender_thread.join(timeout)
+        if self._layerwise_sender_thread.is_alive():
+            return False
         self._layerwise_sender_thread = None
         if self._layerwise_sender_error is not None:
             raise RuntimeError(
                 "layerwise eventfd handshake failed"
             ) from self._layerwise_sender_error
+        return True
+
+    def _require_layerwise_eventfds(self) -> None:
+        """Ensure the eventfd handshake completed before the first layer-wise load.
+
+        Called from bind_layerwise_metadata() on the step that actually carries
+        a layer-wise load. By then the scheduler exists, so the
+        LayerwiseTransferWorker has had a chance to bind the socket. Blocks (and
+        raises) rather than letting a forward pass wait on eventfds the data
+        plane never received.
+        """
+        self._finish_layerwise_eventfd_sender()
 
     def bind_layerwise_metadata(
         self, metadata: LayerwiseLoadMetadata
@@ -1116,6 +1153,14 @@ class FlexKVWorkerConnector:
                     "were registered"
                 )
             return
+        if metadata.has_load:
+            # First real load: the handshake must be done before any attention
+            # layer blocks on an eventfd the worker never received.
+            self._require_layerwise_eventfds()
+        else:
+            # Opportunistic progress check on idle/no-load steps so a handshake
+            # failure surfaces promptly instead of at the first load.
+            self._finish_layerwise_eventfd_sender(timeout=0.0)
         if self._layerwise_sender_error is not None:
             raise RuntimeError(
                 "layerwise eventfd handshake failed"
@@ -1128,6 +1173,15 @@ class FlexKVWorkerConnector:
 
     def shutdown(self) -> None:
         if self.layerwise_counter_pool is not None:
+            # The sender thread still holds these fds; closing them underneath
+            # it would make sendmsg(SCM_RIGHTS) fail or, worse, pass a recycled
+            # descriptor. Give it a bounded chance to finish, and never let a
+            # handshake error escape shutdown.
+            try:
+                self._finish_layerwise_eventfd_sender(timeout=5.0)
+            except Exception as exc:  # noqa: BLE001 - shutdown must not raise
+                logger.warning(
+                    f"layerwise eventfd handshake failed during shutdown: {exc}")
             self.layerwise_counter_pool.close()
             self.layerwise_counter_pool = None
 
@@ -1178,6 +1232,16 @@ class FlexKVConnectorV1Impl:
         # authoritative value before KVManager/TransferEngine construction.
         GLOBAL_CONFIG_FROM_ENV.enable_layerwise_transfer = (
             self.enable_layerwise_transfer)
+        # The in-process assignment above does NOT survive a process boundary:
+        # TransferManager and every transfer worker are created with
+        # mp.get_context('spawn'), so the child re-imports flexkv and rebuilds
+        # GLOBAL_CONFIG_FROM_ENV from the environment alone. Without this
+        # export, transfer_engine._init_workers() reads
+        # enable_layerwise_transfer=False in the child and never constructs the
+        # LayerwiseTransferWorker (hence never binds the eventfd socket), while
+        # the parent still thinks layer-wise is on.
+        os.environ['FLEXKV_ENABLE_LAYERWISE_TRANSFER'] = (
+            '1' if self.enable_layerwise_transfer else '0')
         self._bound_metadata: Optional[FlexKVConnectorMetadata] = None
 
         if role == KVConnectorRole.SCHEDULER:

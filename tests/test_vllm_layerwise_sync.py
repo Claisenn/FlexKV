@@ -110,7 +110,14 @@ def test_counter_pool_rejects_unknown_layer_and_counter():
         pool.wait("layer.99")
 
 
-def test_failed_wait_poisons_pool_to_prevent_stale_counter_reuse():
+def test_failed_wait_recovers_on_next_bind():
+    """A per-layer wait failure must be transient, not terminal.
+
+    _read_eventfd raises TimeoutError after FLEXKV_LAYERWISE_WAIT_TIMEOUT_S
+    (60s by default), which a merely slow transfer can hit. Poisoning the pool
+    permanently would turn one slow load into a dead engine for the rest of the
+    process, so the next bind() drains and reuses the counter instead.
+    """
     attempts = []
 
     def flaky_read(fd):
@@ -129,23 +136,30 @@ def test_failed_wait_poisons_pool_to_prevent_stale_counter_reuse():
     pool.bind(LayerwiseLoadMetadata(enabled=True, counter_id=0, has_load=True))
     with pytest.raises(TimeoutError):
         pool.wait("layer.0")
-    with pytest.raises(RuntimeError, match="unusable"):
-        pool.bind(
-            LayerwiseLoadMetadata(enabled=True, counter_id=0, has_load=True))
-    assert attempts == [10]
+    # Recovers: the counter is reclaimed and usable again.
+    pool.bind(
+        LayerwiseLoadMetadata(enabled=True, counter_id=0, has_load=True))
+    assert pool.wait("layer.0") is None
+    assert attempts == [10, 10]
 
 
-def test_bind_rejects_new_step_until_previous_counter_finishes():
+def test_bind_reclaims_counter_when_forward_skips_layers():
+    """A forward pass that ends early must not wedge the pool.
+
+    vLLM can abort, preempt, or raise between attention layers, leaving some
+    layers of the bound counter unwaited. release() only fires once ALL layers
+    were waited on, so rejecting the next bind() would deadlock the engine
+    permanently. bind() drains the abandoned counter and continues.
+    """
     pool, fake = _pool(layer_names=("a", "b"))
     metadata = LayerwiseLoadMetadata(enabled=True, counter_id=0, has_load=True)
     pool.bind(metadata)
     pool.wait("a")
-    with pytest.raises(RuntimeError, match="previous"):
-        pool.bind(metadata)
-    pool.wait("b")
+    # "b" never waited -- forward aborted. Next step must still bind.
     pool.bind(metadata)
     pool.wait("a")
-    assert fake.reads == [10, 11, 10]
+    pool.wait("b")
+    assert fake.reads == [10, 10, 11]
 
 
 def test_counter_pool_close_is_idempotent():
