@@ -892,6 +892,7 @@ class FlexKVWorkerConnector:
         self.layerwise_counter_pool: Optional[LayerwiseCounterPool] = None
         self._layerwise_sender_thread: Optional[threading.Thread] = None
         self._layerwise_sender_error: Optional[BaseException] = None
+        self._layerwise_sender_cancel = threading.Event()
         logger.info("Finish init FlexKVWorkerConnector")
 
     def register_to_server(
@@ -1100,6 +1101,7 @@ class FlexKVWorkerConnector:
                     socket_path=socket_path,
                     tp_rank_per_node=effective_tp_rank,
                     tp_size_per_node=effective_tp_size,
+                    cancel_event=self._layerwise_sender_cancel,
                 )
             except BaseException as exc:
                 self._layerwise_sender_error = exc
@@ -1131,6 +1133,14 @@ class FlexKVWorkerConnector:
                 "layerwise eventfd handshake failed"
             ) from self._layerwise_sender_error
         return True
+
+    def _cancel_layerwise_eventfd_sender(self) -> None:
+        """Ask the handshake thread to stop retrying and return promptly.
+
+        Without this the sender keeps retrying until its own deadline (360s by
+        default), which is far longer than any sane shutdown grace period.
+        """
+        self._layerwise_sender_cancel.set()
 
     def _require_layerwise_eventfds(self) -> None:
         """Ensure the eventfd handshake completed before the first layer-wise load.
@@ -1174,15 +1184,28 @@ class FlexKVWorkerConnector:
     def shutdown(self) -> None:
         if self.layerwise_counter_pool is not None:
             # The sender thread still holds these fds; closing them underneath
-            # it would make sendmsg(SCM_RIGHTS) fail or, worse, pass a recycled
-            # descriptor. Give it a bounded chance to finish, and never let a
-            # handshake error escape shutdown.
+            # it would make sendmsg(SCM_RIGHTS) fail or, worse, hand the peer a
+            # descriptor number that has since been recycled onto an unrelated
+            # file. So cancel first, then join, and only close once the thread
+            # is actually gone -- a bounded join whose result we ignore is not
+            # enough, because the sender retries for its full deadline.
+            self._cancel_layerwise_eventfd_sender()
             try:
-                self._finish_layerwise_eventfd_sender(timeout=5.0)
+                finished = self._finish_layerwise_eventfd_sender(timeout=5.0)
             except Exception as exc:  # noqa: BLE001 - shutdown must not raise
                 logger.warning(
                     f"layerwise eventfd handshake failed during shutdown: {exc}")
-            self.layerwise_counter_pool.close()
+                finished = True
+            if finished:
+                self.layerwise_counter_pool.close()
+            else:
+                # Cancellation did not take within the grace period. Leaking a
+                # handful of eventfds for the remaining life of the process is
+                # strictly better than closing fds a live thread is about to
+                # pass over a socket.
+                logger.warning(
+                    "layerwise eventfd sender still running at shutdown; "
+                    "leaving its descriptors open to avoid reuse-after-close")
             self.layerwise_counter_pool = None
 
     def __del__(self):
