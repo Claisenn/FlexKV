@@ -32,6 +32,7 @@ class _FakeFDs:
     yet, so settle() can distinguish "a stale unit was reclaimed" from "there
     was nothing to reclaim" without touching real descriptors.
     """
+    """Stand-in for the eventfd layer."""
 
     def __init__(self):
         self.next_fd = 10
@@ -137,6 +138,8 @@ def test_failed_wait_recovers_on_next_bind():
     permanently would turn one slow load into a dead engine for the rest of the
     process, so the next bind() reclaims and reuses the counter instead.
     """
+def test_failed_wait_rejects_future_binds():
+    """A failed wait cannot safely reuse a generationless eventfd."""
     attempts = []
 
     def flaky_read(fd):
@@ -174,6 +177,15 @@ def test_bind_reclaims_counter_when_forward_skips_layers():
     were waited on, so rejecting the next bind() would deadlock the engine
     permanently. bind() reclaims the abandoned counter and continues.
     """
+    with pytest.raises(RuntimeError, match="prior wait failure"):
+        pool.bind(LayerwiseLoadMetadata(enabled=True, counter_id=0, has_load=True))
+    with pytest.raises(RuntimeError, match="prior wait failure"):
+        pool.bind(LayerwiseLoadMetadata(enabled=True, has_load=False))
+    assert attempts == [10]
+
+
+def test_bind_rejects_incomplete_forward():
+    """An incomplete forward cannot safely reuse asynchronous eventfds."""
     pool, fake = _pool(layer_names=("a", "b"))
     metadata = LayerwiseLoadMetadata(enabled=True, counter_id=0, has_load=True)
     pool.bind(metadata)
@@ -359,6 +371,63 @@ def test_counter_reuse_survives_a_transfer_that_never_signals():
         else:
             os.environ["FLEXKV_LAYERWISE_SETTLE_TIMEOUT_S"] = previous
         pool.close()
+    with pytest.raises(RuntimeError, match="previous counter 0 finished"):
+        pool.bind(metadata)
+    assert fake.reads == [10]
+
+
+@pytest.mark.skipif(
+    os.uname().sysname != "Linux",
+    reason="requires Linux eventfd support",
+)
+def test_late_eventfd_signal_cannot_recover_an_incomplete_forward():
+    """A late producer signal must not make a later batch bindable."""
+    pool = LayerwiseCounterPool(("l0", "l1"), num_counters=2)
+    try:
+        pool.bind(LayerwiseLoadMetadata(enabled=True, counter_id=0, has_load=True))
+        os.write(pool.fds[0][0], struct.pack("Q", 1))
+        pool.wait("l0")
+
+        # The missing completion from the abandoned batch lands after the
+        # forward stops. It remains quarantined with its old descriptor set.
+        os.write(pool.fds[0][1], struct.pack("Q", 1))
+        with pytest.raises(RuntimeError, match="previous counter 0 finished"):
+            pool.bind(LayerwiseLoadMetadata(
+                enabled=True, counter_id=1, has_load=True))
+    finally:
+        pool.close()
+
+
+def test_completed_forward_releases_counter_for_later_batches():
+    """A fully consumed batch may safely advance and reuse the ring."""
+    pool, fake = _pool(layer_names=("l0", "l1"))
+    md = lambda cid: LayerwiseLoadMetadata(  # noqa: E731
+        enabled=True, counter_id=cid, has_load=True)
+    for counter_id in (0, 1, 0):
+        pool.bind(md(counter_id))
+        pool.wait("l0")
+        pool.wait("l1")
+
+    assert fake.reads == [10, 11, 12, 13, 10, 11]
+
+
+def test_wait_timeout_rejects_future_binds():
+    """A timeout cannot safely reuse a generationless eventfd."""
+    def timed_out_reader(_fd):
+        raise TimeoutError("simulated")
+
+    fake = _FakeFDs()
+    pool = LayerwiseCounterPool(
+        ("l0", "l1"),
+        fd_factory=fake.create,
+        fd_reader=timed_out_reader,
+        fd_closer=fake.close,
+    )
+    pool.bind(LayerwiseLoadMetadata(enabled=True, counter_id=0, has_load=True))
+    with pytest.raises(TimeoutError):
+        pool.wait("l0")
+    with pytest.raises(RuntimeError, match="prior wait failure"):
+        pool.bind(LayerwiseLoadMetadata(enabled=True, counter_id=0, has_load=True))
 
 
 def test_send_to_worker_returns_promptly_when_cancelled():

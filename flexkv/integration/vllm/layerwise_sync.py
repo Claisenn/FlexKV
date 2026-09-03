@@ -44,6 +44,7 @@ def _settle_eventfd(fd: int, timeout_s: float) -> bool:
     on timeout: not finding a unit is an expected outcome when the transfer that
     owed it was cancelled.
     """
+    """Consume one pending eventfd unit, waiting at most timeout_s."""
     try:
         ready, _, _ = select.select([fd], [], [], timeout_s)
         if not ready:
@@ -175,6 +176,9 @@ class LayerwiseCounterPool:
         self.num_counters = num_counters
         self._fd_reader = fd_reader
         self._fd_closer = fd_closer
+        # Retained for compatibility with external test fixtures that inject a
+        # settler. Reusing an incomplete asynchronous counter is unsafe, so
+        # this pool deliberately no longer invokes it.
         self._fd_settler = fd_settler
         self._fds = [
             [fd_factory() for _ in range(self.num_layers)]
@@ -305,6 +309,19 @@ class LayerwiseCounterPool:
             # ALL layers have been waited on. Reclaim it instead.
             self._reclaim_counter(stale)
         self._failed_error = None
+        if self._failed_error is not None:
+            raise RuntimeError(
+                "layer-wise counter pool is unusable after a prior wait failure"
+            ) from self._failed_error
+        if self._active_counter >= 0:
+            # Eventfd units carry no generation. The data plane writes them
+            # asynchronously, so an incomplete forward cannot be safely
+            # reclaimed without an explicit producer-quiescence acknowledgement
+            # or per-generation descriptors.
+            raise RuntimeError(
+                "received new layer-wise metadata before the previous "
+                f"counter {self._active_counter} finished"
+            )
         if not metadata.enabled or not metadata.has_load:
             self._active_counter = -1
             return
@@ -363,6 +380,7 @@ class LayerwiseCounterPool:
         timeout_s: float = 360.0,
         retry_interval_s: float = 0.05,
         cancel_event: "threading.Event | None" = None,
+        cancel_event: threading.Event | None = None,
     ) -> None:
         """Send all counter eventfds to the LayerwiseTransferWorker.
 
