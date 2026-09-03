@@ -26,12 +26,20 @@ def _short_socket_path(prefix):
 
 
 class _FakeFDs:
+    """Stand-in for the eventfd layer.
+
+    ``pending`` models units the data plane has signalled but nobody consumed
+    yet, so settle() can distinguish "a stale unit was reclaimed" from "there
+    was nothing to reclaim" without touching real descriptors.
+    """
     """Stand-in for the eventfd layer."""
 
     def __init__(self):
         self.next_fd = 10
         self.reads = []
         self.closed = []
+        self.settled = []
+        self.pending = set()
 
     def create(self):
         fd = self.next_fd
@@ -40,7 +48,15 @@ class _FakeFDs:
 
     def read(self, fd):
         self.reads.append(fd)
+        self.pending.discard(fd)
         return 1
+
+    def settle(self, fd, _timeout_s):
+        self.settled.append(fd)
+        if fd in self.pending:
+            self.pending.discard(fd)
+            return True
+        return False
 
     def close(self, fd):
         self.closed.append(fd)
@@ -53,6 +69,7 @@ def _pool(layer_names=("layer.0", "layer.1", "layer.2")):
         fd_factory=fake.create,
         fd_reader=fake.read,
         fd_closer=fake.close,
+        fd_settler=fake.settle,
     )
     return pool, fake
 
@@ -113,6 +130,14 @@ def test_counter_pool_rejects_unknown_layer_and_counter():
         pool.wait("layer.99")
 
 
+def test_failed_wait_recovers_on_next_bind():
+    """A per-layer wait failure must be transient, not terminal.
+
+    _read_eventfd raises TimeoutError after FLEXKV_LAYERWISE_WAIT_TIMEOUT_S
+    (60s by default), which a merely slow transfer can hit. Poisoning the pool
+    permanently would turn one slow load into a dead engine for the rest of the
+    process, so the next bind() reclaims and reuses the counter instead.
+    """
 def test_failed_wait_rejects_future_binds():
     """A failed wait cannot safely reuse a generationless eventfd."""
     attempts = []
@@ -129,10 +154,29 @@ def test_failed_wait_rejects_future_binds():
         fd_factory=fake.create,
         fd_reader=flaky_read,
         fd_closer=fake.close,
+        fd_settler=fake.settle,
     )
     pool.bind(LayerwiseLoadMetadata(enabled=True, counter_id=0, has_load=True))
     with pytest.raises(TimeoutError):
         pool.wait("layer.0")
+    # Recovers: the counter is reclaimed and usable again. Rebinding settles
+    # the debt left by the timed-out batch first, so the wait below consumes
+    # this batch's own completion rather than a leftover unit.
+    pool.bind(
+        LayerwiseLoadMetadata(enabled=True, counter_id=0, has_load=True))
+    assert fake.settled == [10]
+    assert pool.wait("layer.0") is None
+    assert attempts == [10, 10]
+
+
+def test_bind_reclaims_counter_when_forward_skips_layers():
+    """A forward pass that ends early must not wedge the pool.
+
+    vLLM can abort, preempt, or raise between attention layers, leaving some
+    layers of the bound counter unwaited. release() only fires once ALL layers
+    were waited on, so rejecting the next bind() would deadlock the engine
+    permanently. bind() reclaims the abandoned counter and continues.
+    """
     with pytest.raises(RuntimeError, match="prior wait failure"):
         pool.bind(LayerwiseLoadMetadata(enabled=True, counter_id=0, has_load=True))
     with pytest.raises(RuntimeError, match="prior wait failure"):
@@ -146,6 +190,187 @@ def test_bind_rejects_incomplete_forward():
     metadata = LayerwiseLoadMetadata(enabled=True, counter_id=0, has_load=True)
     pool.bind(metadata)
     pool.wait("a")
+    # "b" never waited -- forward aborted. Next step must still bind, and it
+    # settles the signal still owed to "b" (fd 11) before rebinding.
+    pool.bind(metadata)
+    pool.wait("a")
+    pool.wait("b")
+    assert fake.settled == [11]
+    assert fake.reads == [10, 10, 11]
+
+
+def _signal(pool, counter_id, layer_index, count=1):
+    """Emulate the data plane signalling one layer's completion."""
+    os.write(pool.fds[counter_id][layer_index], struct.pack("Q", count))
+
+
+class _Waiter:
+    """A single background wait() whose completion can be polled twice.
+
+    Deliberately ONE thread: two threads waiting on the same layer would race
+    for the same semaphore unit, and whichever loses blocks forever on a unit
+    that is never re-sent. vLLM calls wait_for_layer_load() synchronously from
+    the forward, so a second concurrent waiter is a test artifact, not a
+    scenario worth modelling.
+    """
+
+    def __init__(self, pool, layer_name):
+        self._done = threading.Event()
+        self._error = None
+
+        def run():
+            try:
+                pool.wait(layer_name)
+            except BaseException as exc:  # noqa: BLE001 - surfaced in finished()
+                self._error = exc
+            finally:
+                self._done.set()
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def finished(self, seconds):
+        """True if the wait has returned, i.e. it consumed a unit."""
+        completed = self._done.wait(seconds)
+        if completed and self._error is not None:
+            raise self._error
+        return completed
+
+
+def test_late_signal_from_abandoned_batch_cannot_satisfy_a_later_load():
+    """A completion that lands after the counter was abandoned must not leak.
+
+    The data plane launches with sync=false and signals each layer later, from
+    cudaLaunchHostFunc or the polling thread, so a signal belonging to an
+    abandoned batch can arrive after the forward gave up on it. If that unit
+    survives, it satisfies a wait() once the counter rotates back and attention
+    runs against KV that has not landed.
+
+    Real eventfds on purpose: a fake reader cannot express "a unit arrived
+    later", which is the whole failure mode.
+    """
+    layers = ("l0", "l1")
+    pool = LayerwiseCounterPool(layers, num_counters=2)
+    md = lambda cid: LayerwiseLoadMetadata(  # noqa: E731
+        enabled=True, counter_id=cid, has_load=True)
+    try:
+        pool.bind(md(0))
+        _signal(pool, 0, 0)
+        pool.wait("l0")
+        # Forward aborts here: "l1" is never waited on.
+
+        pool.bind(md(1))
+        # The abandoned batch's l1 completion arrives only now, after counter 0
+        # was already handed back.
+        _signal(pool, 0, 1)
+        _signal(pool, 1, 0)
+        _signal(pool, 1, 1)
+        pool.wait("l0")
+        pool.wait("l1")
+
+        # Counter 0 comes back around. The data plane signals l0 only; the
+        # stale unit must NOT be able to stand in for l1's real completion.
+        pool.bind(md(0))
+        _signal(pool, 0, 0)
+        pool.wait("l0")
+        waiter = _Waiter(pool, "l1")
+        assert not waiter.finished(1.0), (
+            "wait() was satisfied by a stale signal from the abandoned batch")
+
+        # The same waiter unblocks only once the real completion arrives.
+        _signal(pool, 0, 1)
+        assert waiter.finished(5.0)
+    finally:
+        pool.close()
+
+
+def test_timed_out_counter_settles_its_late_signal_before_reuse():
+    """The timeout path must not drop the counter identity.
+
+    wait() records the failure and hands the counter back for reclaim. If it
+    merely cleared the active counter, the next bind() would see nothing stale,
+    skip settling, and leave the in-flight unit to satisfy a future wait().
+    """
+    layers = ("l0", "l1")
+    pool = LayerwiseCounterPool(layers, num_counters=2)
+    md = lambda cid: LayerwiseLoadMetadata(  # noqa: E731
+        enabled=True, counter_id=cid, has_load=True)
+    previous = os.environ.get("FLEXKV_LAYERWISE_WAIT_TIMEOUT_S")
+    os.environ["FLEXKV_LAYERWISE_WAIT_TIMEOUT_S"] = "0.2"
+    try:
+        pool.bind(md(0))
+        with pytest.raises(TimeoutError):
+            pool.wait("l0")
+        # Both layers of the timed-out batch complete late.
+        _signal(pool, 0, 0)
+        _signal(pool, 0, 1)
+
+        os.environ["FLEXKV_LAYERWISE_WAIT_TIMEOUT_S"] = "5"
+        # Reusing counter 0 must consume both late units up front, so the waits
+        # below block on this batch's own signals.
+        pool.bind(md(0))
+        waiter = _Waiter(pool, "l0")
+        assert not waiter.finished(1.0), (
+            "wait() consumed a leftover unit from the timed-out batch")
+        _signal(pool, 0, 0)
+        assert waiter.finished(5.0)
+    finally:
+        if previous is None:
+            os.environ.pop("FLEXKV_LAYERWISE_WAIT_TIMEOUT_S", None)
+        else:
+            os.environ["FLEXKV_LAYERWISE_WAIT_TIMEOUT_S"] = previous
+        pool.close()
+
+
+def test_counter_reuse_survives_a_transfer_that_never_signals():
+    """A cancelled transfer must not block or fail the step that reuses it.
+
+    Settling an abandoned batch waits for signals still in flight, but a
+    cancelled or dead transfer may never signal at all. Blocking a fresh step
+    indefinitely -- or failing it -- to collect a unit that is not coming would
+    be worse than the wedge this path exists to prevent, so the wait is bounded
+    and taken at most once per layer.
+    """
+    layers = ("l0", "l1")
+    md = lambda cid: LayerwiseLoadMetadata(  # noqa: E731
+        enabled=True, counter_id=cid, has_load=True)
+    previous = os.environ.get("FLEXKV_LAYERWISE_SETTLE_TIMEOUT_S")
+    os.environ["FLEXKV_LAYERWISE_SETTLE_TIMEOUT_S"] = "0.3"
+    # Constructed after the env var: the settle window is read at __init__.
+    pool = LayerwiseCounterPool(layers, num_counters=2)
+    try:
+        pool.bind(md(0))
+        _signal(pool, 0, 0)
+        pool.wait("l0")
+        # Forward aborts and the transfer is cancelled: l1 is never signalled.
+        pool.bind(md(1))
+
+        started = time.monotonic()
+        pool.bind(md(0))  # must not raise, must not hang
+        first_reuse = time.monotonic() - started
+        assert first_reuse < 5.0
+
+        # Complete this batch cleanly so the only debt left on counter 0 is the
+        # l1 unit that is never coming.
+        _signal(pool, 0, 0)
+        _signal(pool, 0, 1)
+        pool.wait("l0")
+        pool.wait("l1")
+
+        started = time.monotonic()
+        pool.bind(md(0))  # the never-signalled layer must not be waited on again
+        second_reuse = time.monotonic() - started
+        assert second_reuse < 0.2, (
+            f"blocking settle repeated on every reuse ({second_reuse:.2f}s)")
+
+        # Still correct: this batch's own signal is what unblocks the wait.
+        _signal(pool, 0, 0)
+        pool.wait("l0")
+    finally:
+        if previous is None:
+            os.environ.pop("FLEXKV_LAYERWISE_SETTLE_TIMEOUT_S", None)
+        else:
+            os.environ["FLEXKV_LAYERWISE_SETTLE_TIMEOUT_S"] = previous
+        pool.close()
     with pytest.raises(RuntimeError, match="previous counter 0 finished"):
         pool.bind(metadata)
     assert fake.reads == [10]
